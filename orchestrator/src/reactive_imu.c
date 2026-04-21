@@ -17,6 +17,8 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <drm/drm.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 /* ══════════════════════════════════════════════════════════
  * CONFIGURATION
@@ -51,6 +53,16 @@
 #define CID_EXPOSURE      0x00980911
 #define CID_ANALOGUE_GAIN 0x009e0903
 #define CID_TEST_PATTERN  0x009f0903
+/* Custom kernel control — imx219-binning-ctrl.patch */
+#define CID_BINNING       0x00981900
+
+/* Binning trigger thresholds:
+ * Enable 2×2 hardware binning when sensor is near max exposure
+ * AND max gain — indicates a dark scene where binning helps SNR */
+//#define BINNING_EXP_THRESH  (EXPOSURE_MAX - 200)   /* >3322 → dark */
+#define BINNING_EXP_THRESH  2900
+//#define BINNING_GAIN_THRESH (GAIN_MAX - 30)         /* >202  → dark */
+#define BINNING_GAIN_THRESH 100
 
 /* Colors XRGB8888 */
 #define COL_BG    0xFF0A0A0A
@@ -94,6 +106,8 @@ static volatile int    g_running     = 1;
 static volatile int    g_cam_exp     = EXPOSURE_NOM;
 static volatile int    g_cam_gain    = GAIN_NOM;
 static volatile int    g_cam_pat     = 0;
+static volatile int    g_cam_bin     = 0;   /* hardware 2×2 binning */
+static volatile int    g_cam_dma     = 0;   /* DMA-BUF export active */
 
 /* debayered frame: cam_thread writes, drm_thread reads
  * size = DEBAY_W * DEBAY_H * 4 bytes = ~8 MB              */
@@ -103,7 +117,21 @@ static pthread_mutex_t g_frame_mutex = PTHREAD_MUTEX_INITIALIZER;
 typedef struct {
     void   *start;
     size_t  length;
+    int     dma_fd;    /* DMA-BUF fd exported via VIDIOC_EXPBUF */
 } cam_buf_t;
+
+/* ── Zero-copy DMA-BUF export (Feature 10) ──────────────
+ * cam_thread exports each V4L2 buffer as a DMA-BUF fd.
+ * On each captured frame, g_dma_fd is updated to the fd
+ * of the buffer just dequeued. Any consumer (ML pipeline,
+ * secondary process) can mmap that fd directly — zero copy.
+ * The fd is also written to DMAFD_PATH for external access.
+ * ─────────────────────────────────────────────────────── */
+#define DMAFD_PATH       "/tmp/cam_dmafd"
+#define DMAFD_SOCK   	 "/tmp/cam_dma.sock"
+static volatile int    g_dma_fd        = -1;  /* current frame DMA-BUF fd */
+static volatile int    g_dma_buf_index = -1;  /* which buffer index */
+static volatile size_t g_dma_buf_size  = 0;   /* bytes in that buffer */
 
 static void sig_handler(int s) { (void)s; g_running = 0; }
 
@@ -388,7 +416,7 @@ static void blit_camera(drm_dev_t *d)
 
 /* ── HUD render ── */
 static void drm_render(drm_dev_t *d, imu_state_t *s,
-                       int exposure, int gain, int pattern)
+                       int exposure, int gain, int pattern, int binning, int dma)
 {
     int W = d->width, H = d->height;
     uint32_t sc = s->tilt_alert ? COL_RED : COL_GREEN;
@@ -461,6 +489,16 @@ static void drm_render(drm_dev_t *d, imu_state_t *s,
     snprintf(buf, sizeof(buf), "Exp:%-4d  Gain:%-3d  Pat:%d",
              exposure, gain, pattern);
     draw_string(d, lx, ly, buf, COL_WHITE, 2);
+    ly += 30;
+    snprintf(buf, sizeof(buf), "Binning: %s",
+             binning ? "ON (2x2 low-light)" : "OFF");
+    draw_string(d, lx, ly, buf,
+                binning ? COL_YELL : COL_GRAY, 2);
+    ly += 30;
+    snprintf(buf, sizeof(buf), "DMA-BUF: %s",
+             dma ? "EXPORTING (zero-copy)" : "inactive");
+    draw_string(d, lx, ly, buf,
+                dma ? COL_GREEN : COL_GRAY, 2);
 
     /* bottom border */
     fill_rect(d, 0, H-4, W, 4, COL_BLUE);
@@ -554,7 +592,7 @@ static void *drm_thread(void *arg)
         s = g_imu;
         pthread_mutex_unlock(&g_mutex);
 
-        drm_render(&dev, &s, g_cam_exp, g_cam_gain, g_cam_pat);
+        drm_render(&dev, &s, g_cam_exp, g_cam_gain, g_cam_pat, g_cam_bin, g_cam_dma);
         usleep(DRM_REFRESH_US);
     }
 
@@ -574,7 +612,7 @@ static void *v4l2_thread(void *arg)
         return NULL;
     }
 
-    int last_exp=EXPOSURE_NOM, last_gain=GAIN_NOM, last_pat=0;
+    int last_exp=EXPOSURE_NOM, last_gain=GAIN_NOM, last_pat=0, last_bin=0;
 
     while (g_running) {
         imu_state_t s;
@@ -606,12 +644,27 @@ static void *v4l2_thread(void *arg)
             last_gain = want_gain; g_cam_gain = want_gain;
         }
 
+        /* Hardware 2×2 binning — enable in dark scenes:
+         * exposure near max AND gain near max means sensor
+         * is struggling with low light — binning 4 pixels
+         * into 1 quadruples photon collection per output pixel */
+        //int want_bin = (last_exp  >= BINNING_EXP_THRESH &&
+        //                last_gain >= BINNING_GAIN_THRESH) ? 1 : 0;
+        int want_bin = (last_exp >= BINNING_EXP_THRESH) ? 1 : 0;
+        if (want_bin != last_bin) {
+            v4l2_set(fd, CID_BINNING, want_bin);
+            fprintf(stderr, "[V4L2] binning=%d (exp=%d)\n",
+                    want_bin, last_exp);
+            last_bin = want_bin; g_cam_bin = want_bin;
+        }
+
         usleep(V4L2_POLL_US);
     }
 
     v4l2_set(fd, CID_TEST_PATTERN,  0);
     v4l2_set(fd, CID_EXPOSURE,      EXPOSURE_NOM);
     v4l2_set(fd, CID_ANALOGUE_GAIN, GAIN_NOM);
+    v4l2_set(fd, CID_BINNING,       0);
     close(fd);
     return NULL;
 }
@@ -625,7 +678,7 @@ static void *v4l2_thread(void *arg)
 /* White balance gains for IMX219 daylight
  * G is reference=1.0, R and B need boosting */
 #define WB_R  1.1f
-#define WB_B  1.5f
+#define WB_B  1.1f
 
 static void rggb10_to_xrgb(const uint8_t *src, uint32_t *dst,
                              int width, int height)
@@ -703,8 +756,35 @@ static void *cam_thread(void *arg)
         if (bufs[i].start == MAP_FAILED) {
             perror("[CAM] mmap"); close(fd); return NULL;
         }
+
+        /* ── Feature 10: export each buffer as DMA-BUF fd ──
+         * VIDIOC_EXPBUF returns a file descriptor referencing
+         * the same physically contiguous DMA memory that unicam
+         * DMA-writes frames into. Any process that receives this
+         * fd can mmap it and read the raw frame — zero CPU copy. */
+        struct v4l2_exportbuffer expbuf = {0};
+        expbuf.type  = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        expbuf.index = i;
+        expbuf.flags = O_RDONLY;
+        if (ioctl(fd, VIDIOC_EXPBUF, &expbuf) < 0) {
+            perror("[CAM] VIDIOC_EXPBUF");
+            bufs[i].dma_fd = -1;
+        } else {
+            bufs[i].dma_fd = expbuf.fd;
+            fprintf(stderr, "[CAM] buf[%d] DMA-BUF fd=%d size=%zu bytes\n",
+                    i, expbuf.fd, bufs[i].length);
+        }
+
         ioctl(fd, VIDIOC_QBUF, &buf);
     }
+
+    /* Verify at least one DMA-BUF export succeeded */
+    int dma_ok = 0;
+    for (int i = 0; i < CAM_BUFS; i++)
+        if (bufs[i].dma_fd >= 0) dma_ok++;
+    fprintf(stderr, "[CAM] DMA-BUF export: %d/%d buffers exported\n",
+            dma_ok, CAM_BUFS);
+    g_cam_dma = (dma_ok == CAM_BUFS) ? 1 : 0;
 
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
@@ -742,15 +822,121 @@ static void *cam_thread(void *arg)
         memcpy(g_frame, tmp, DEBAY_W * DEBAY_H * sizeof(uint32_t));
         pthread_mutex_unlock(&g_frame_mutex);
 
+        /* ── Feature 10: publish active DMA-BUF fd ──────────
+         * Update shared globals so any consumer knows which fd
+         * holds the latest raw frame in zero-copy DMA memory.
+         * Write fd number to /tmp/cam_dmafd so external
+         * processes (ML inference, analytics) can open it. */
+        if (bufs[buf.index].dma_fd >= 0) {
+            g_dma_fd        = bufs[buf.index].dma_fd;
+            g_dma_buf_index = buf.index;
+            g_dma_buf_size  = bufs[buf.index].length;
+
+            /* Write fd to file for external consumer */
+            FILE *fp = fopen(DMAFD_PATH, "w");
+            if (fp) {
+                fprintf(fp, "%d %d %zu\n",
+                        bufs[buf.index].dma_fd,
+                        buf.index,
+                        bufs[buf.index].length);
+                fclose(fp);
+            }
+        }
+
         ioctl(fd, VIDIOC_QBUF, &buf);
     }
 
     free(tmp);
     ioctl(fd, VIDIOC_STREAMOFF, &type);
-    for (int i = 0; i < CAM_BUFS; i++)
+    for (int i = 0; i < CAM_BUFS; i++) {
         munmap(bufs[i].start, bufs[i].length);
+        if (bufs[i].dma_fd >= 0) close(bufs[i].dma_fd);
+    }
+    unlink(DMAFD_PATH);   /* remove /tmp/cam_dmafd on exit */
+    g_cam_dma = 0;
     close(fd);
-    fprintf(stderr, "[CAM] stopped\n");
+    fprintf(stderr, "[CAM] stopped — DMA-BUF fds closed\n");
+    return NULL;
+}
+
+/* ── DMA-BUF fd server thread ───────────────────────────
+ * Listens on a Unix socket. When a consumer connects,
+ * sends the current DMA-BUF fd via SCM_RIGHTS ancillary
+ * data — the only correct way to share fds cross-process. */
+static void *dma_server_thread(void *arg)
+{
+    (void)arg;
+
+    unlink(DMAFD_SOCK);
+
+    int srv = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (srv < 0) { perror("[DMA] socket"); return NULL; }
+
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, DMAFD_SOCK, sizeof(addr.sun_path)-1);
+
+    if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("[DMA] bind"); close(srv); return NULL;
+    }
+    if (listen(srv, 4) < 0) {
+        perror("[DMA] listen"); close(srv); return NULL;
+    }
+
+    fprintf(stderr, "[DMA] server listening on %s\n", DMAFD_SOCK);
+
+    while (g_running) {
+        /* accept with timeout */
+        fd_set fds;
+        FD_ZERO(&fds); FD_SET(srv, &fds);
+        struct timeval tv = {.tv_sec=1, .tv_usec=0};
+        if (select(srv+1, &fds, NULL, NULL, &tv) <= 0)
+            continue;
+
+        int cli = accept(srv, NULL, NULL);
+        if (cli < 0) continue;
+
+        int cur_fd   = g_dma_fd;
+        int cur_idx  = g_dma_buf_index;
+        size_t cur_sz = g_dma_buf_size;
+
+        if (cur_fd < 0) {
+            close(cli);
+            continue;
+        }
+
+        /* Send fd via SCM_RIGHTS */
+        char cmsg_buf[CMSG_SPACE(sizeof(int))];
+        struct iovec iov = {0};
+
+        /* Send metadata as regular data */
+        struct { int index; size_t size; } meta = {cur_idx, cur_sz};
+        iov.iov_base = &meta;
+        iov.iov_len  = sizeof(meta);
+
+        struct msghdr msg = {0};
+        msg.msg_iov    = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control    = cmsg_buf;
+        msg.msg_controllen = sizeof(cmsg_buf);
+
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type  = SCM_RIGHTS;
+        cmsg->cmsg_len   = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(cmsg), &cur_fd, sizeof(int));
+
+        if (sendmsg(cli, &msg, 0) < 0)
+            perror("[DMA] sendmsg");
+        else
+            fprintf(stderr, "[DMA] sent fd=%d idx=%d size=%zu to consumer\n",
+                    cur_fd, cur_idx, cur_sz);
+
+        close(cli);
+    }
+
+    close(srv);
+    unlink(DMAFD_SOCK);
     return NULL;
 }
 
@@ -774,16 +960,18 @@ int main(void)
     fprintf(stderr, "Reactive IMU — 4-thread integration\n");
     fprintf(stderr, "Stop X first: /etc/init.d/xserver-nodm stop\n\n");
 
-    pthread_t t_imu, t_drm, t_v4l2, t_cam;
+    pthread_t t_imu, t_drm, t_v4l2, t_cam, t_dma_srv;
     pthread_create(&t_imu,  NULL, imu_thread,  NULL);
     pthread_create(&t_cam,  NULL, cam_thread,  NULL);
     pthread_create(&t_drm,  NULL, drm_thread,  NULL);
     pthread_create(&t_v4l2, NULL, v4l2_thread, NULL);
+    pthread_create(&t_dma_srv, NULL, dma_server_thread, NULL);
 
     pthread_join(t_imu,  NULL);
     pthread_join(t_cam,  NULL);
     pthread_join(t_drm,  NULL);
     pthread_join(t_v4l2, NULL);
+    pthread_join(t_dma_srv, NULL);
 
     free(g_frame);
     syslog(LOG_INFO, "Reactive IMU stopped");
